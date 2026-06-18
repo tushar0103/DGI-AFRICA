@@ -1,0 +1,184 @@
+import oracledb
+import requests
+import json
+ 
+# ===============================
+# ORACLE CLIENT INIT
+# ===============================
+oracledb.init_oracle_client(
+    lib_dir=r"C:\oracle\instantclient_19_29"
+)
+ 
+conn = oracledb.connect(
+    user="MCF",
+    password="MCF",
+    dsn="localhost:1521/orcl"
+)
+ 
+print("✅ Oracle connected")
+cur = conn.cursor()
+ 
+# ===============================
+# DGI TOKEN + HEADERS
+# ===============================
+TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1bmlxdWVfbmFtZSI6IkExOTEwNzExUHxDRDAxMDA0MDk1LTEiLCJyb2xlIjoiVGF4cGF5ZXIiLCJuYmYiOjE3Nzc2NDIzMDksImV4cCI6MTc5ODY3MTYwMCwiaWF0IjoxNzc3NjQyMzA5LCJpc3MiOiJkZXZlbG9wcGVyLmRnaXJkYy5jZCIsImF1ZCI6ImRldmVsb3BwZXIuZGdpcmRjLmNkIn0.MTdMxiVtRVGFXnMat48RHddae-4Qd0Ve37RPM4KQwo8"
+ 
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+ 
+API_URL = "https://developper.dgirdc.cd/edef/api/invoice/"
+ 
+# ===============================
+# STEP 1: FETCH PENDING INVOICE
+# ===============================
+cur.execute("""
+    SELECT vc_invoice_no, vc_dt_jason
+    FROM mcf.hd_inv_sync
+    WHERE vc_status = 'JSON_READY'
+""")
+ 
+row = cur.fetchone()
+if not row:
+    raise Exception("❌ No invoice with status JSON_READY found")
+ 
+invoice_no, json_data = row
+print(f"\n➡ Sending invoice: {invoice_no}")
+ 
+json_payload = json_data.read() if hasattr(json_data, "read") else json_data
+ 
+# ===============================
+# STEP 2: POST INVOICE
+# ===============================
+try:
+    response = requests.post(
+        API_URL,
+        json=json.loads(json_payload),
+        headers=HEADERS,
+        timeout=30
+    )
+ 
+    status = "SUCCESS" if response.status_code in (200, 201) else "ERROR"
+    print("HTTP Status:", response.status_code)
+    print("Response:", response.text)
+ 
+    cur.execute("""
+        UPDATE mcf.hd_inv_sync
+           SET vc_status    = :status,
+               vc_dt_rjason = :response,
+               dt_sync_date = SYSDATE
+         WHERE vc_invoice_no = :invoice_no
+    """, {
+        "status": status,
+        "response": response.text,
+        "invoice_no": invoice_no
+    })
+    conn.commit()
+ 
+except Exception as e:
+    print("Error:", str(e))
+    cur.execute("""
+        UPDATE mcf.hd_inv_sync
+           SET vc_status    = 'ERROR',
+               vc_dt_rjason = :error,
+               dt_sync_date = SYSDATE
+         WHERE vc_invoice_no = :invoice_no
+    """, {
+        "error": str(e),
+        "invoice_no": invoice_no
+    })
+    conn.commit()
+    raise
+ 
+# ===============================
+# STEP 3: CONFIRM INVOICE
+# ===============================
+cur.execute("""
+    SELECT vc_dt_rjason
+    FROM mcf.hd_inv_sync
+    WHERE vc_invoice_no = :p_invoice_no
+""", {"p_invoice_no": invoice_no})
+ 
+resp_clob = cur.fetchone()[0]
+resp_text = resp_clob.read() if hasattr(resp_clob, "read") else resp_clob
+resp_json = json.loads(resp_text)
+ 
+uid = resp_json.get("uid")
+ 
+cur_total = resp_json.get("total")
+vat_total = resp_json.get("vtotal")
+ 
+if not uid:
+    raise Exception("❌ UID not found in response JSON")
+ 
+payload = {
+    "total": float(cur_total),
+    "vtotal": float(vat_total)
+}
+ 
+confirm_url = f"https://developper.dgirdc.cd/edef/api/invoice/{uid}/confirm"
+ 
+response = requests.put(
+    confirm_url,
+    headers=HEADERS,
+    json=payload,
+    timeout=30
+)
+ 
+print("Confirm HTTP STATUS:", response.status_code)
+print("Confirm API RESPONSE:", response.text)
+ 
+resp_data = response.json()
+ 
+if response.status_code == 200 and "errorCode" not in resp_data:
+    cur.execute("""
+        UPDATE mcf.hd_inv_sync
+           SET vc_status     = 'CONFIRMED',
+               vc_uid_no     = :p_uid,
+               vc_qrcode     = :p_qr,
+               vc_code       = :p_code,
+               vc_nim        = :p_nim,
+               vc_counter    = :p_counter,
+               vc_date_time  = :p_date_time,
+               vc_hd_rjason  = :p_resp,
+               dt_sync_date  = SYSDATE
+         WHERE vc_invoice_no = :p_invoice_no
+    """, {
+        "p_uid": uid,
+        "p_qr": resp_data.get("qrCode"),
+        "p_code": resp_data.get("codeDEFDGI"),
+        "p_nim": resp_data.get("nim"),
+        "p_counter": resp_data.get("counters"),
+        "p_date_time": resp_data.get("dateTime"),
+        "p_resp": response.text,
+        "p_invoice_no": invoice_no
+    })
+    conn.commit()
+    print("✅ INVOICE CONFIRMED SUCCESSFULLY")
+else:
+    cur.execute("""
+        UPDATE mcf.hd_inv_sync
+           SET vc_status     = 'CONFIRM_ERROR',
+               vc_err_code   = :p_err_code,
+               vc_err_desc   = :p_err_desc,
+               vc_hd_rjason  = :p_resp,
+               dt_sync_date  = SYSDATE
+         WHERE vc_invoice_no = :p_invoice_no
+    """, {
+        "p_err_code": resp_data.get("errorCode"),
+        "p_err_desc": resp_data.get("errorDesc"),
+        "p_resp": response.text,
+        "p_invoice_no": invoice_no
+    })
+    conn.commit()
+    print("❌ CONFIRM FAILED")
+ 
+# ===============================
+# CLEANUP
+# ===============================
+cur.close()
+conn.close()
+ 
+print("✅ Process completed successfully")
