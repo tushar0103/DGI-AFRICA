@@ -1,3 +1,17 @@
+commented ----start 
+API_URL = "https://developper.dgirdc.cd/edef/api/invoice/"
+
+above is for test
+
+
+below live
+
+API_URL = "https://edef.dgirdc.cd/api/invoice"
+
+comment end -------------------------------------
+
+
+
 import oracledb
 import requests
 import json
